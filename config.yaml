@@ -1,0 +1,19 @@
+wallet:
+  # Using bittensor's default wallet path
+  path: "~/.bittensor/wallets/"
+  name: "default"
+  hotkey: "default"
+
+subtensor:
+  network: "finney" # or pass a local subtensor as so: "ws://x.xx.xx.xx:9944"
+
+dca:
+  # Note: all percentages are whole numbers
+  total_sell_percentage: 10    # Total portion of stake to sell (e.g., 10 means sell up to 10% of total stake)
+  unstake_percentage: 1        # Percentage to unstake per cycle (e.g., 1 means sell 1% of base stake per cycle)
+  min_stake_threshold: 0.1     # Minimum stake threshold to continue unstaking (in tao)
+  normal_interval: 60          # Run unstake every 60 seconds when stake exists
+  low_balance_interval: 300    # Check every 300 seconds when no stake is found
+  allowed_subnets:
+    - 4                      # List of allowed netuids to unstake from
+  slippage_tolerance: 5        # Maximum allowed slippage percentage
