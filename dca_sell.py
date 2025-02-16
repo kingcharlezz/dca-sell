@@ -234,18 +234,45 @@ async def dca_unstake_loop(wallet: Wallet, subtensor: SubtensorInterface, config
       - unstake_percentage: The portion of base stake to sell in each cycle
     
     For each subnet:
-      - The current stake is locked as the base stake upon the first sale
-      - The total amount to sell is calculated as (base stake * total_sell_percentage / 100)
-      - In each cycle, it sells (unstake_percentage)% of the base stake
-      - The script ensures that the cumulative sold amount never exceeds the total_sell_percentage
+      - The current stake is locked as the base stake upon the first sale.
+      - The total amount to sell is calculated as (base stake * total_sell_percentage / 100).
+      - In each cycle, it sells (unstake_percentage)% of the base stake.
+      - The script ensures that the cumulative sold amount never exceeds the total_sell_percentage.
+      - Additionally, it tracks the cumulative slippage percentage incurred by all unstake transactions.
+        If the next transaction’s expected slippage causes the cumulative slippage to exceed the
+        configured 'max_total_slippage' (see config), the sale will be skipped.
+    
+    Example config.yaml structure:
+    
+    wallet:
+      path: <bittensor wallet path, e.g., "~/.bittensor/wallets/default">
+      name: <wallet name>
+      hotkey: <hotkey string or address>
+    
+    subtensor:
+      network: <network name>
+      host: <node websocket URL>
+      port: <node port>
+    
+    dca:
+      total_sell_percentage: 10      # Total portion of stake to sell (e.g., 10 means sell up to 10% of base stake)
+      unstake_percentage: 1          # Percentage to unstake per cycle (e.g., 1 means sell 1% of base stake per cycle)
+      min_stake_threshold: 0.1       # Minimum stake threshold to continue unstaking (in tao)
+      normal_interval: 60            # Run unstake every 60 seconds when stake exists
+      low_balance_interval: 300      # Check every 300 seconds when no stake is found
+      allowed_subnets:
+        - 64                       # List of allowed netuids to unstake from
+      slippage_tolerance: 5          # Maximum allowed slippage percentage per transaction
+      max_total_slippage: 10         # Maximum allowed cumulative slippage percentage across transactions
     """
     dca_config = config.get("dca", {})
-    normal_interval = dca_config.get("normal_interval", 60)
+    normal_interval = dca_config.get("normal_interval", 300)
     low_balance_interval = dca_config.get("low_balance_interval", 300)
     unstake_percentage = dca_config.get("unstake_percentage", 1)
     total_sell_percentage = dca_config.get("total_sell_percentage", 10)
     allowed_subnets = dca_config.get("allowed_subnets", [])
     slippage_tolerance = dca_config.get("slippage_tolerance", 5)
+    max_total_slippage = dca_config.get("max_total_slippage", 10)
     min_stake_threshold = dca_config.get("min_stake_threshold", 0.0001)
 
     if not allowed_subnets:
@@ -256,8 +283,9 @@ async def dca_unstake_loop(wallet: Wallet, subtensor: SubtensorInterface, config
         f"[bold green]Starting DCA sell loop:[/bold green] "
         f"selling up to {total_sell_percentage}% of stake from subnets: {allowed_subnets} "
         f"in {unstake_percentage}% increments, "
-        f"with a maximum slippage tolerance of {slippage_tolerance}% "
-        f"and minimum stake threshold of {min_stake_threshold} tao."
+        f"with a maximum per-tx slippage tolerance of {slippage_tolerance}% "
+        f"and a cumulative slippage limit of {max_total_slippage}%. "
+        f"Minimum stake threshold is {min_stake_threshold} tao."
     )
 
     # Fetch dynamic subnet info once before looping.
@@ -273,8 +301,9 @@ async def dca_unstake_loop(wallet: Wallet, subtensor: SubtensorInterface, config
     # Dictionary to track if we're waiting for stake increase on each subnet
     waiting_for_increase: dict[int, bool] = {netuid: False for netuid in allowed_subnets}
 
-    # Track cumulative sold amounts
+    # Track cumulative sold amounts (in tao) and cumulative slippage (in percent)
     cumulative_sold: dict[int, float] = {}
+    cumulative_slippage: dict[int, float] = {}
 
     while True:
         try:
@@ -313,6 +342,7 @@ async def dca_unstake_loop(wallet: Wallet, subtensor: SubtensorInterface, config
                     if netuid not in base_stakes:
                         base_stakes[netuid] = stake
                         cumulative_sold[netuid] = 0.0
+                        cumulative_slippage[netuid] = 0.0
                         console.print(f"[green]Locked base stake for subnet {netuid} at {stake}.[/green]")
 
                     total_to_sell = base_stakes[netuid].tao * (total_sell_percentage / 100)
@@ -323,9 +353,9 @@ async def dca_unstake_loop(wallet: Wallet, subtensor: SubtensorInterface, config
                         )
                         continue
 
-                    # Calculate sale amount as a percentage of the total_sell_percentage
-                    # If total_sell_percentage is 10% and unstake_percentage is 1%,
-                    # then we sell 0.1% of base stake per cycle
+                    # Calculate sale amount as a percentage of the base stake.
+                    # For example, if total_sell_percentage is 10% and unstake_percentage is 1%,
+                    # then each cycle sells 0.1% of base stake.
                     cycle_sell_percentage = (total_sell_percentage * unstake_percentage) / 100
                     planned_sale_amount = base_stakes[netuid].tao * (cycle_sell_percentage / 100)
                     available_to_sell = total_to_sell - cumulative_sold[netuid]
@@ -343,6 +373,17 @@ async def dca_unstake_loop(wallet: Wallet, subtensor: SubtensorInterface, config
                     received_amount, slippage_str, slippage_pct_float = _calculate_slippage(
                         subnet_info, amount_to_unstake
                     )
+                    
+                    # Check if cumulative slippage would exceed the maximum allowed.
+                    if cumulative_slippage[netuid] + slippage_pct_float > max_total_slippage:
+                        console.print(
+                            f"[red]Cumulative slippage would exceed max allowed "
+                            f"({cumulative_slippage[netuid] + slippage_pct_float:.4f}% > {max_total_slippage}%). "
+                            f"Skipping sale on subnet {netuid}.[/red]"
+                        )
+                        continue
+
+                    # Check per transaction slippage against the tolerance.
                     if slippage_pct_float > slippage_tolerance:
                         console.print(
                             f"[red]Slippage {slippage_str} exceeds tolerance of {slippage_tolerance}% for subnet {netuid}. Skipping sale.[/red]"
@@ -361,7 +402,8 @@ async def dca_unstake_loop(wallet: Wallet, subtensor: SubtensorInterface, config
                         f"({cycle_sell_percentage:.3f}% of base {base_stakes[netuid]}) from subnet {netuid} "
                         f"with expected slippage {slippage_str}. "
                         f"Progress: {cumulative_sold[netuid]:.4f}/{total_to_sell:.4f} tao "
-                        f"({(cumulative_sold[netuid]/total_to_sell*100):.1f}% of target)"
+                        f"({(cumulative_sold[netuid]/total_to_sell*100):.1f}% of target). "
+                        f"Cumulative slippage so far: {cumulative_slippage[netuid]:.4f}%"
                     )
 
                     try:
@@ -376,8 +418,9 @@ async def dca_unstake_loop(wallet: Wallet, subtensor: SubtensorInterface, config
                             allow_partial_stake=True,
                             status=None,
                         )
-                        # Update the cumulative sold amount
+                        # Update the cumulative sold amount and cumulative slippage.
                         cumulative_sold[netuid] += sale_amount_tao
+                        cumulative_slippage[netuid] += slippage_pct_float
                     except Exception as unstake_err:
                         console.print(f"[red]Error selling on subnet {netuid}: {unstake_err}[/red]")
                         continue
@@ -426,14 +469,15 @@ async def main():
       port: <node port>
     
     dca:
-      total_sell_percentage: 10    # Total portion of stake to sell (e.g., 10 means sell up to 10% of total stake)
-      unstake_percentage: 1        # Percentage to unstake per cycle (e.g., 1 means sell 1% of base stake per cycle)
-      min_stake_threshold: 0.1     # Minimum stake threshold to continue unstaking (in tao)
-      normal_interval: 60          # Run unstake every 60 seconds when stake exists
-      low_balance_interval: 300    # Check every 300 seconds when no stake is found
+      total_sell_percentage: 10      # Total portion of stake to sell (e.g., 10 means sell up to 10% of base stake)
+      unstake_percentage: 1          # Percentage to unstake per cycle (e.g., 1 means sell 1% of base stake per cycle)
+      min_stake_threshold: 0.1       # Minimum stake threshold to continue unstaking (in tao)
+      normal_interval: 60            # Run unstake every 60 seconds when stake exists
+      low_balance_interval: 300      # Check every 300 seconds when no stake is found
       allowed_subnets:
-        - 64                      # List of allowed netuids to unstake from
-      slippage_tolerance: 5        # Maximum allowed slippage percentage
+        - 64                       # List of allowed netuids to unstake from
+      slippage_tolerance: 5          # Maximum allowed slippage percentage per transaction
+      max_total_slippage: 10         # Maximum allowed cumulative slippage percentage across transactions
     """
     try:
         with open("config.yaml", "r") as f:
